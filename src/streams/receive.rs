@@ -450,12 +450,23 @@ impl StreamRx {
     pub(crate) fn handle_rtp(
         &mut self,
         now: Instant,
-        header: RtpHeader,
+        mut header: RtpHeader,
         payload: Arc<[u8]>,
         seq_no: SeqNo,
         time: MediaTime,
     ) -> RtpPacket {
         trace!("Handle RTP: {:?}", header);
+
+        // The remote may stop sending the MID/RID header extensions once
+        // RTCP report blocks have acknowledged the SSRC binding. The stream
+        // identity is authoritative — repair the values so RTP-mode API
+        // users can always key on them.
+        if header.ext_vals.mid.is_none() {
+            header.ext_vals.mid = Some(self.midrid.mid());
+        }
+        if header.ext_vals.rid.is_none() {
+            header.ext_vals.rid = self.midrid.rid();
+        }
 
         let need_clock_rate = self.last_clock_rate.map(|(pt, _)| pt) != Some(header.payload_type);
         if need_clock_rate {
@@ -863,6 +874,36 @@ pub(crate) struct RegisterUpdateReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handle_rtp_repairs_missing_mid_rid_from_stream_identity() {
+        let now = already_happened();
+        let rid: Rid = "h".into();
+        let mut stream = StreamRx::new(7.into(), MidRid("vid".into(), Some(rid)), false);
+
+        // Simulate a remote that stopped sending the MID/RID extensions
+        // after SSRC binding: the wire header carries neither.
+        let header = RtpHeader {
+            payload_type: Pt::new_with_value(96),
+            sequence_number: 42,
+            ssrc: 7.into(),
+            ..Default::default()
+        };
+        assert!(header.ext_vals.mid.is_none());
+        assert!(header.ext_vals.rid.is_none());
+
+        let payload: Arc<[u8]> = Arc::from(&[0u8; 4][..]);
+        let packet = stream.handle_rtp(
+            now,
+            header,
+            payload,
+            42.into(),
+            MediaTime::new(0, Frequency::NINETY_KHZ),
+        );
+
+        assert_eq!(packet.header.ext_vals.mid, Some("vid".into()));
+        assert_eq!(packet.header.ext_vals.rid, Some(rid));
+    }
 
     #[test]
     fn paused_timestamp_repair_moves_time_forward() {

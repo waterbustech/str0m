@@ -47,6 +47,7 @@ pub struct RtcConfig {
     pub(crate) reordering_size_video: usize,
     pub(crate) send_buffer_audio: usize,
     pub(crate) send_buffer_video: usize,
+    pub(crate) null_pacer_batch: usize,
     pub(crate) rtp_mode: bool,
     pub(crate) enable_raw_packets: bool,
     pub(crate) dtls_version: DtlsVersion,
@@ -524,6 +525,19 @@ impl RtcConfig {
         self
     }
 
+    /// Sets how many packets the null pacer drains from one stream before
+    /// round-robin moves to the next.
+    ///
+    /// Only relevant when BWE is disabled (the null pacer is in use). Higher
+    /// values improve cache locality for SFU-style workloads fanning out to
+    /// many streams, at the cost of per-stream fairness within a poll cycle.
+    ///
+    /// Defaults to 1 (strict round-robin).
+    pub fn set_null_pacer_batch(mut self, batch: usize) -> Self {
+        self.null_pacer_batch = batch.max(1);
+        self
+    }
+
     /// Returns the setting for video resend size.
     ///
     /// ```
@@ -708,6 +722,7 @@ impl Default for RtcConfig {
             reordering_size_video: 30,
             send_buffer_audio: 50,
             send_buffer_video: 1000,
+            null_pacer_batch: 1,
             rtp_mode: false,
             enable_raw_packets: false,
             dtls_version: DtlsVersion::Dtls12,

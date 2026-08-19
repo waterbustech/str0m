@@ -27,8 +27,8 @@ impl PacerImpl {
         PacerImpl::LeakyBucket(LeakyBucketPacer::new(rate))
     }
 
-    pub fn null() -> PacerImpl {
-        PacerImpl::Null(NullPacer::default())
+    pub fn null(batch: usize) -> PacerImpl {
+        PacerImpl::Null(NullPacer::new(batch))
     }
 
     pub fn start_probe(&mut self, config: ProbeClusterConfig) {

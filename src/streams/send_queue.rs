@@ -11,6 +11,7 @@ pub(crate) struct SendQueue {
     queue: VecDeque<RtpPacket>,
     total: TotalQueue,
     last_emitted: Option<Instant>,
+    capacity: Option<usize>,
 }
 
 impl SendQueue {
@@ -19,10 +20,23 @@ impl SendQueue {
             queue: VecDeque::new(),
             total: TotalQueue::default(),
             last_emitted: None,
+            capacity: None,
         }
     }
 
+    /// Cap the queue length in packets. Pushes while at capacity are dropped.
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = Some(capacity);
+    }
+
     pub fn push(&mut self, mut packet: RtpPacket) {
+        if let Some(cap) = self.capacity {
+            if self.queue.len() >= cap {
+                trace!("SendQueue at capacity {}, dropping packet", cap);
+                return;
+            }
+        }
+
         // Every incoming packet must be timestamped withe a handle_timeout.
         // This sentinel value indicates it is needed.
         packet.timestamp = not_happening();

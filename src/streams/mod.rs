@@ -19,6 +19,22 @@ use crate::util::already_happened;
 pub use self::receive::StreamRx;
 pub use self::send::{RtpWrite, StreamTx};
 
+/// Incoming NACK entries a [`StreamTx`] could not answer from its RTX cache.
+///
+/// Emitted as [`crate::Event::NackReceived`] in RTP mode. This happens when
+/// the cache is disabled (0-sized via [`StreamTx::set_rtx_cache()`]) or the
+/// packets have expired from it. An SFU that maintains its own packet cache
+/// can retransmit via [`StreamTx::write_rtp()`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NackReceived {
+    /// Mid of the stream the NACK arrived on.
+    pub mid: Mid,
+    /// Rid of the stream the NACK arrived on.
+    pub rid: Option<Rid>,
+    /// The NACKed sequence numbers not served from the RTX cache.
+    pub seq_nos: Vec<SeqNo>,
+}
+
 mod receive;
 pub(crate) mod register;
 pub(crate) mod register_nack;
@@ -144,6 +160,13 @@ pub(crate) struct Streams {
     /// All outgoing encoded streams.
     streams_tx: HashMap<Ssrc, StreamTx>,
 
+    /// MidRid -> `streams_tx` map key. `stream_tx_by_midrid` is on the SFU
+    /// per-packet fan-out path; without this index every write scans all
+    /// send streams (O(m-sections) per packet per subscriber). The value is
+    /// the *map key* SSRC, which never changes — `DirectApi::reset_stream_tx`
+    /// swaps the stream's wire SSRC in place without rekeying the map.
+    midrid_tx_index: HashMap<MidRid, Ssrc>,
+
     /// Local SSRC used before we got any StreamTx. This is used for RTCP if we don't
     /// have any reasonable value to use.
     default_ssrc_tx: Ssrc,
@@ -185,6 +208,7 @@ impl Streams {
             rx_lookup: Default::default(),
             last_rx_lookup_cleanup: already_happened(),
             streams_tx: Default::default(),
+            midrid_tx_index: Default::default(),
             default_ssrc_tx: 0.into(), // this will be changed
             mids_to_report: Vec::with_capacity(10),
             any_nack_active: None,
@@ -342,12 +366,14 @@ impl Streams {
         rtx: Option<Ssrc>,
         midrid: MidRid,
     ) -> &mut StreamTx {
+        self.midrid_tx_index.insert(midrid, ssrc);
         self.streams_tx
             .entry(ssrc)
             .or_insert_with(|| StreamTx::new(ssrc, rtx, midrid, self.enable_stats, self.mtu_warn))
     }
 
     pub fn remove_stream_tx(&mut self, ssrc: Ssrc) -> bool {
+        self.midrid_tx_index.retain(|_, v| *v != ssrc);
         self.streams_tx.remove(&ssrc).is_some()
     }
 
@@ -489,6 +515,17 @@ impl Streams {
         }
     }
 
+    pub(crate) fn poll_unserved_nacks(&mut self) -> Option<NackReceived> {
+        self.streams_tx.values_mut().find_map(|s| {
+            let seq_nos = s.poll_unserved_nacks()?;
+            Some(NackReceived {
+                mid: s.mid(),
+                rid: s.rid(),
+                seq_nos,
+            })
+        })
+    }
+
     pub(crate) fn poll_keyframe_request(&mut self) -> Option<KeyframeRequest> {
         self.streams_tx.values_mut().find_map(|s| {
             let kind = s.poll_keyframe_request()?;
@@ -607,7 +644,25 @@ impl Streams {
     }
 
     pub(crate) fn stream_tx_by_midrid(&mut self, midrid: MidRid) -> Option<&mut StreamTx> {
-        self.streams_tx.values_mut().find(|s| s.is_midrid(midrid))
+        // Fast path: O(1) via the index, verified against the stream in case
+        // an edge path bypassed index maintenance.
+        if let Some(&key) = self.midrid_tx_index.get(&midrid) {
+            let hit = self
+                .streams_tx
+                .get(&key)
+                .is_some_and(|s| s.is_midrid(midrid));
+            if hit {
+                return self.streams_tx.get_mut(&key);
+            }
+        }
+        // Slow path: linear scan, then repair the index.
+        let key = self
+            .streams_tx
+            .iter()
+            .find(|(_, s)| s.is_midrid(midrid))
+            .map(|(k, _)| *k)?;
+        self.midrid_tx_index.insert(midrid, key);
+        self.streams_tx.get_mut(&key)
     }
 
     pub(crate) fn stream_rx_by_midrid(
@@ -625,6 +680,7 @@ impl Streams {
     }
 
     pub(crate) fn remove_streams_by_mid(&mut self, mid: Mid) {
+        self.midrid_tx_index.retain(|midrid, _| midrid.mid() != mid);
         self.streams_tx.retain(|_, s| s.mid() != mid);
         self.streams_rx.retain(|_, s| s.mid() != mid);
         self.rx_lookup.retain(|_, v| v.mid != mid);

@@ -348,6 +348,11 @@ impl<'a> DirectApi<'a> {
         self.rtc.session.streams.stream_tx_by_midrid(midrid)
     }
 
+    /// Iterate over all send streams.
+    pub fn streams_tx(&mut self) -> impl Iterator<Item = &mut StreamTx> {
+        self.rtc.session.streams.streams_tx()
+    }
+
     /// Reset a transmit stream to use a new SSRC and optionally a new RTX SSRC.
     ///
     /// This changes the SSRC of an existing stream and resets all relevant state.

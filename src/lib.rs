@@ -786,7 +786,7 @@ pub mod rtp {
         Vp8Descriptor, Vp8DescriptorError, Vp8Patch, Vp8PatchBuilder, Vp8PatchError,
     };
     pub use crate::rtp_::{RtpHeader, SeqNo, Ssrc, VideoOrientation};
-    pub use crate::streams::{RtpPacket, RtpWrite, StreamPaused, StreamRx, StreamTx};
+    pub use crate::streams::{NackReceived, RtpPacket, RtpWrite, StreamPaused, StreamRx, StreamTx};
 
     /// Debug output of the unencrypted RTP and RTCP packets.
     ///
@@ -936,6 +936,22 @@ struct SendAddr {
     destination: SocketAddr,
 }
 
+/// Reference to an outgoing datagram produced by [`Rtc::poll_datagram_into()`].
+///
+/// Borrowing variant of [`net::Transmit`]: the datagram bytes live in the
+/// caller-provided scratch buffer instead of an owned allocation.
+#[derive(Debug)]
+pub struct TransmitRef<'a> {
+    /// The protocol the transmission should use.
+    pub proto: net::Protocol,
+    /// The local socket the datagram should be sent from.
+    pub source: SocketAddr,
+    /// The remote address the datagram should be sent to.
+    pub destination: SocketAddr,
+    /// The datagram contents, borrowed from the scratch buffer.
+    pub contents: &'a [u8],
+}
+
 /// Events produced by [`Rtc::poll_output()`].
 #[derive(Debug)]
 #[non_exhaustive]
@@ -1016,6 +1032,13 @@ pub enum Event {
     ///
     /// The request is either PLI (Picture Loss Indication) or FIR (Full Intra Request).
     KeyframeRequest(KeyframeRequest),
+
+    /// Incoming NACK entries that could not be answered from the RTX cache.
+    ///
+    /// Only emitted in RTP mode, when the RTX cache is disabled (0-sized) or
+    /// the NACKed packets have expired from it. An SFU keeping its own packet
+    /// cache can retransmit via [`StreamTx::write_rtp()`][streams::StreamTx::write_rtp].
+    NackReceived(streams::NackReceived),
 
     /// Whether an incoming encoded stream is paused.
     ///
@@ -1557,7 +1580,8 @@ impl Rtc {
                 | Event::PeerStats(_)
                 | Event::ChannelBufferedAmountLow(_)
                 | Event::EgressBitrateEstimate(_)
-                | Event::KeyframeRequest(_) => {
+                | Event::KeyframeRequest(_)
+                | Event::NackReceived(_) => {
                     trace!("{:?}", e)
                 }
                 _ => debug!("{:?}", e),
@@ -1570,6 +1594,39 @@ impl Rtc {
         }
 
         Ok(o)
+    }
+
+    /// Poll the next outgoing datagram (DTLS or RTP/RTCP) into `scratch`.
+    ///
+    /// Fast-path variant of [`Rtc::poll_output()`] for send loops that batch
+    /// datagrams (e.g. `sendmmsg`): the encrypted datagram is written into the
+    /// caller-provided buffer, which is cleared first and never reallocated as
+    /// long as its capacity covers the MTU. Only session/DTLS datagrams are
+    /// drained — events, ICE transmits and timeouts must still be polled via
+    /// [`Rtc::poll_output()`].
+    ///
+    /// Returns `None` when there is nothing to send, the `Rtc` is closed, or
+    /// no send address has been nominated yet.
+    pub fn poll_datagram_into<'a>(&mut self, scratch: &'a mut Vec<u8>) -> Option<TransmitRef<'a>> {
+        if self.state == RtcState::Closed {
+            return None;
+        }
+        let send = self.send_addr.as_ref()?;
+        let (proto, source, destination) = (send.proto, send.source, send.destination);
+
+        let datagram = None
+            .or_else(|| self.dtls.poll_packet())
+            .or_else(|| self.session.poll_datagram(self.last_now))?;
+
+        scratch.clear();
+        scratch.extend_from_slice(&datagram);
+
+        Some(TransmitRef {
+            proto,
+            source,
+            destination,
+            contents: scratch,
+        })
     }
 
     fn do_poll_output(&mut self) -> Result<Output, RtcError> {

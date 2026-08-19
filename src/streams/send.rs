@@ -115,6 +115,12 @@ pub struct StreamTx {
     /// If we have a pending incoming remb request.
     pending_request_remb: Option<Bitrate>,
 
+    /// NACKed sequence numbers the RTX cache could not serve. Surfaced via
+    /// [`crate::Event::NackReceived`] so an SFU keeping its own packet cache
+    /// (RTX cache disabled) can retransmit. Bounded by
+    /// `MAX_PENDING_UNSERVED_NACKS`.
+    pending_unserved_nacks: Vec<SeqNo>,
+
     /// Statistics of outgoing data.
     ///
     /// Stats are use to calculate the rtx ratio also when statistics events are disabled.
@@ -138,6 +144,10 @@ pub struct StreamTx {
     /// MTU warn threshold; used to cap spurious-padding RTX cache lookups.
     mtu_warn: usize,
 }
+
+/// Ceiling on NACKed seq numbers buffered for [`crate::Event::NackReceived`].
+/// NACK RTCP packets are small; this bounds memory if the user never polls.
+const MAX_PENDING_UNSERVED_NACKS: usize = 64;
 
 /// RTP packet data to enqueue on a direct RTP send stream.
 ///
@@ -285,6 +295,7 @@ impl StreamTx {
             last_sender_report: already_happened(),
             pending_request_keyframe: None,
             pending_request_remb: None,
+            pending_unserved_nacks: Vec::new(),
             stats: StreamTxStats::new(enable_stats),
             rtx_ratio: (0.0, already_happened()),
             pt_for_padding: None,
@@ -357,6 +368,17 @@ impl StreamTx {
     /// This overrides the default behavior.
     pub fn set_unpaced(&mut self, unpaced: bool) {
         self.unpaced = Some(unpaced);
+    }
+
+    /// Cap the send queue length in packets.
+    ///
+    /// [`StreamTx::write_rtp()`] calls made while the queue is at capacity are
+    /// dropped. This bounds egress memory when the remote peer stops draining
+    /// the queue (e.g. a stalled or disconnecting receiver).
+    ///
+    /// The default is unbounded.
+    pub fn set_send_queue_capacity(&mut self, capacity: usize) {
+        self.send_queue.set_capacity(capacity);
     }
 
     /// Write RTP packet to a send stream.
@@ -902,14 +924,34 @@ impl StreamTx {
         now: Instant,
     ) -> Option<()> {
         // Turning NackEntry into SeqNo we need to know a SeqNo "close by" to lengthen the 16 bit
-        // sequence number into the 64 bit we have in SeqNo.
-        let seq_no = self.rtx_cache.last_cached_seq_no()?;
+        // sequence number into the 64 bit we have in SeqNo. When the RTX cache is disabled
+        // (0-sized), fall back to the last sent seq no so unserved NACKs can still be surfaced.
+        let seq_no = match self.rtx_cache.last_cached_seq_no() {
+            Some(seq_no) => seq_no,
+            None => {
+                // No RTX cache reference. `last_sent_seq_no` is only meaningful
+                // once we have actually produced a packet — before the first
+                // write it is a random `SeqNo::default()`, and extending a
+                // peer's 16-bit NACK PIDs against it would surface phantom
+                // unserved NACKs at an unrelated baseline. Drop such pre-roll
+                // NACKs (there is nothing real to retransmit yet).
+                if self.rtp_and_wallclock.is_none() {
+                    return Some(());
+                }
+                self.last_sent_seq_no
+            }
+        };
         let iter = entries.flat_map(|n| n.into_iter(seq_no));
 
         // Schedule all resends. They will be handled on next poll_packet
         for seq_no in iter {
             let Some(packet) = self.rtx_cache.get_cached_packet_by_seq_no(seq_no) else {
-                // Packet was not available in RTX cache, it has probably expired.
+                // Packet was not available in RTX cache (expired, or the cache is
+                // disabled). Surface it so the API user can retransmit from its
+                // own cache via write_rtp().
+                if self.pending_unserved_nacks.len() < MAX_PENDING_UNSERVED_NACKS {
+                    self.pending_unserved_nacks.push(seq_no);
+                }
                 continue;
             };
 
@@ -922,6 +964,13 @@ impl StreamTx {
         }
 
         Some(())
+    }
+
+    pub(crate) fn poll_unserved_nacks(&mut self) -> Option<Vec<SeqNo>> {
+        if self.pending_unserved_nacks.is_empty() {
+            return None;
+        }
+        Some(std::mem::take(&mut self.pending_unserved_nacks))
     }
 
     pub(crate) fn need_sr(&self, now: Instant) -> bool {

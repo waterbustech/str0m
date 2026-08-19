@@ -142,7 +142,7 @@ impl Session {
             let bwe = Bwe::new(rate);
             (pacer, Some(bwe))
         } else {
-            (PacerImpl::null(), None)
+            (PacerImpl::null(config.null_pacer_batch), None)
         };
 
         let enable_stats = config.stats_interval.is_some();
@@ -750,6 +750,10 @@ impl Session {
 
         if let Some(req) = self.streams.poll_keyframe_request() {
             return Some(Event::KeyframeRequest(req));
+        }
+
+        if let Some(nack) = self.streams.poll_unserved_nacks() {
+            return Some(Event::NackReceived(nack));
         }
 
         if let Some(report) = self.streams.poll_sender_feedback() {

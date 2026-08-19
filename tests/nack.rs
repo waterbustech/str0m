@@ -2,11 +2,11 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use netem::{NetemConfig, Probability, RandomLoss};
-use str0m::RtcError;
 use str0m::format::Codec;
 use str0m::media::MediaKind;
 use str0m::rtp::rtcp::Rtcp;
 use str0m::rtp::{ExtensionValues, RawPacket, RtpWrite, SeqNo, Ssrc};
+use str0m::{Event, RtcError};
 
 mod common;
 use common::{connect_l_r, init_crypto_default, init_log, progress};
@@ -308,6 +308,104 @@ pub fn nack_delay() -> Result<(), RtcError> {
     assert!(nacks_rx.iter().all(|f| f < &Duration::from_millis(200)));
 
     assert_eq!(nacks_rx.len(), nacks_tx.len());
+
+    Ok(())
+}
+
+#[test]
+pub fn unserved_nacks_surface_as_event() -> Result<(), RtcError> {
+    init_log();
+    init_crypto_default();
+
+    let (mut l, mut r) = connect_l_r();
+
+    // 5% random loss on R's incoming queue (L -> R has loss).
+    let loss_config = NetemConfig::new()
+        .loss(RandomLoss::new(Probability::new(0.05)))
+        .seed(42);
+    r.set_netem(loss_config);
+
+    let mid = "vid".into();
+    let ssrc_tx: Ssrc = 42.into();
+    let ssrc_rtx: Ssrc = 44.into();
+
+    l.direct_api().declare_media(mid, MediaKind::Video);
+    l.direct_api()
+        .declare_stream_tx(ssrc_tx, Some(ssrc_rtx), mid, None);
+
+    r.direct_api().declare_media(mid, MediaKind::Video);
+    r.direct_api()
+        .expect_stream_rx(ssrc_tx, Some(ssrc_rtx), mid, None);
+
+    let max = l.last.max(r.last);
+    l.last = max;
+    r.last = max;
+
+    let params = l.params_vp8();
+    let pt = params.pt();
+    let ssrc = l.direct_api().stream_tx_by_mid(mid, None).unwrap().ssrc();
+
+    // Disable the RTX cache — the SFU case where NACKs are answered from an
+    // application-level packet cache instead.
+    l.direct_api()
+        .stream_tx(&ssrc)
+        .unwrap()
+        .set_rtx_cache(0, Duration::from_secs(0), None);
+
+    let to_write = [0x1, 0x2, 0x3, 0x4];
+    for index in 0..500usize {
+        let wallclock = l.start + l.duration();
+        let mut direct = l.direct_api();
+        let stream = direct.stream_tx(&ssrc).unwrap();
+
+        let time = (index * 1000 + 47_000_000) as u32;
+        let seq_no = (47_000 + index as u64).into();
+        stream.write_rtp(RtpWrite::new(pt, seq_no, time, wallclock, to_write).nackable(true));
+
+        progress(&mut l, &mut r)?;
+    }
+
+    // Let pending NACKs flush.
+    let settle_time = l.duration() + Duration::from_secs(3);
+    loop {
+        progress(&mut l, &mut r)?;
+        if l.duration() > settle_time {
+            break;
+        }
+    }
+
+    // R noticed the loss and sent NACKs.
+    let nacks_rx = l
+        .events
+        .iter()
+        .filter_map(|(_, e)| match e.as_raw_packet() {
+            Some(RawPacket::RtcpRx(Rtcp::Nack(p))) => Some(p),
+            _ => None,
+        })
+        .count();
+    assert!(nacks_rx > 0, "expected R to NACK lost packets");
+
+    // With the RTX cache disabled, every NACK surfaces as NackReceived with
+    // the unwrapped seq nos in the written range.
+    let unserved: Vec<SeqNo> = l
+        .events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            Event::NackReceived(nack) => {
+                assert_eq!(nack.mid, mid);
+                Some(nack.seq_nos.clone())
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert!(!unserved.is_empty(), "expected unserved NACKs to surface");
+    for seq_no in &unserved {
+        assert!(
+            (47_000..47_500).contains(&**seq_no),
+            "seq {seq_no:?} in written range"
+        );
+    }
 
     Ok(())
 }
